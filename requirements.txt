@@ -1,0 +1,8 @@
+litellm
+scikit-learn
+tiktoken
+beautifulsoup4
+lxml
+PyPDF2
+rich
+python-dotenv
