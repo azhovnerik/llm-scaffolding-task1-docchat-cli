@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 import re
+import pickle
 from dataclasses import dataclass
 from typing import List, Tuple, Iterable, Optional
 
@@ -93,12 +94,38 @@ def read_pdf_file(path: str) -> str:
         return ""
 
 
+# Поддерживаемые расширения индексируемых файлов
+SUPPORTED_EXTS = {
+    ".txt",
+    ".md",
+    ".html",
+    ".htm",
+    ".erb",
+    ".pdf",
+}
+
+# Имя файла, в котором хранится сериализованный индекс (внутри каталога документов)
+INDEX_FILENAME = ".docchat_index.pkl"
+
+
+def _iter_doc_paths(root: str) -> Iterable[str]:
+    """Перебирает поддерживаемые файлы в каталоге документов."""
+    ignore_dirs = {".git", "node_modules", "dist", "build", ".venv", "venv", "__pycache__"}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
+        for name in filenames:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in SUPPORTED_EXTS:
+                yield os.path.join(dirpath, name)
+
+
 def iter_docs(root: str) -> Iterable[Tuple[str, str]]:
     """
     Рекурсивно обходит каталог root (неограниченная глубина) и
     возвращает (путь, текст) для поддерживаемых расширений.
     """
-    exts = {
+    readers = {
         ".txt": read_text_file,
         ".md": read_text_file,
         ".html": read_html_file,
@@ -106,19 +133,35 @@ def iter_docs(root: str) -> Iterable[Tuple[str, str]]:
         ".erb": read_erb_file,
         ".pdf": read_pdf_file,
     }
-    ignore_dirs = {".git", "node_modules", "dist", "build", ".venv", "venv", "__pycache__"}
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        # фильтруем нежелательные каталоги на лету
-        dirnames[:] = [d for d in dirnames if d not in ignore_dirs]
+    for path in _iter_doc_paths(root):
+        ext = os.path.splitext(path)[1].lower()
+        reader = readers.get(ext)
+        if not reader:
+            continue
+        text = reader(path)
+        if text.strip():
+            yield path, text
 
-        for name in filenames:
-            ext = os.path.splitext(name)[1].lower()
-            if ext in exts:
-                path = os.path.join(dirpath, name)
-                text = exts[ext](path)
-                if text.strip():
-                    yield path, text
+
+def docs_signature(root: str) -> list[tuple[str, int, int]]:
+    """Создает сигнатуру каталога документов для обнаружения изменений.
+
+    Возвращает отсортированный список кортежей (относительный путь, размер, mtime_ns).
+    Используем относительные пути, чтобы перенос каталога не сбрасывал кэш.
+    """
+
+    signature: list[tuple[str, int, int]] = []
+    for path in _iter_doc_paths(root):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            # Файл мог быть удален между обходом и stat — пропустим
+            continue
+        rel = os.path.relpath(path, root)
+        signature.append((rel, int(st.st_size), int(st.st_mtime_ns)))
+    signature.sort()
+    return signature
 
 
 def chunk_text(text: str, max_chars: int = 2000, overlap: int = 200) -> list[str]:
@@ -156,6 +199,7 @@ class RagIndex:
         self.chunks: List[RagChunk] = []
         self.vectorizer: Optional[TfidfVectorizer] = None
         self.matrix = None
+        self.signature: list[tuple[str, int, int]] = []
 
     def build(self, docs_dir: str, max_chars: int = 2000, overlap: int = 200):
         self.chunks.clear()
@@ -171,6 +215,44 @@ class RagIndex:
         corpus = [c.chunk_text for c in self.chunks]
         self.matrix = self.vectorizer.fit_transform(corpus)
         console.print(f"[green]✔ Индекс построен: {len(self.chunks)} чанков[/green]")
+
+    def save(self, path: str):
+        if not self.chunks or self.vectorizer is None or self.matrix is None:
+            return
+        payload = {
+            "chunks": self.chunks,
+            "vectorizer": self.vectorizer,
+            "matrix": self.matrix,
+            "signature": self.signature,
+        }
+        try:
+            with open(path, "wb") as f:
+                pickle.dump(payload, f)
+        except Exception as e:
+            console.print(f"[yellow]Предупреждение: не удалось сохранить индекс: {e}[/yellow]")
+
+    @classmethod
+    def load(cls, path: str) -> Optional["RagIndex"]:
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            console.print(f"[yellow]Предупреждение: не удалось загрузить индекс: {e}[/yellow]")
+            return None
+
+        required_keys = {"chunks", "vectorizer", "matrix", "signature"}
+        if not isinstance(payload, dict) or not required_keys.issubset(payload):
+            console.print("[yellow]Предупреждение: файл индекса поврежден, требуется перестроение.[/yellow]")
+            return None
+
+        idx = cls()
+        idx.chunks = payload["chunks"]
+        idx.vectorizer = payload["vectorizer"]
+        idx.matrix = payload["matrix"]
+        idx.signature = payload["signature"]
+        return idx
 
     def retrieve(self, query: str, top_k: int = 4) -> List[RagChunk]:
         if not self.chunks or self.vectorizer is None or self.matrix is None:
@@ -344,10 +426,35 @@ def build_index(args) -> Optional[RagIndex]:
     docs_dir = resolve_docs_path(args)
     if not docs_dir:
         return None
+    index_path = os.path.join(docs_dir, INDEX_FILENAME)
+    current_signature = docs_signature(docs_dir)
+
+    cached_idx = RagIndex.load(index_path)
+    if cached_idx and cached_idx.signature == current_signature:
+        console.print("[green]Используется сохраненный индекс с диска[/green]")
+        return cached_idx
+
+    if cached_idx and cached_idx.signature != current_signature:
+        console.print("[yellow]Обнаружены изменения в документах. Перестраиваю индекс...[/yellow]")
+        try:
+            os.remove(index_path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            console.print(f"[yellow]Предупреждение: не удалось удалить устаревший индекс: {e}[/yellow]")
+
     idx = RagIndex()
+    idx.signature = current_signature
     idx.build(docs_dir, max_chars=args.chunk_chars, overlap=args.overlap)
     if not idx.chunks:
+        try:
+            os.remove(index_path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
         return None
+    idx.save(index_path)
     return idx
 
 
